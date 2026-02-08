@@ -634,8 +634,10 @@ class LBM(Module):
             text_embeds = self.language_model.encode_text(text)
 
         # image preprocess
-
+        b, c, t, h, w = images.shape
+        images = rearrange(images, 'b c t h w -> (b t) c h w')
         images = self.image_preprocess(images)
+        images = rearrange(images, '(b t) c h w -> b c t h w', b=b, t=t)
 
         image_embeds = self.accept_video_wrapper(images, eval_with_no_grad = True)
 

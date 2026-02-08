@@ -6,6 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+debug_data/
+data/
+checkpoints/
+.vscode/
+YCB_processed/
+
 # Distribution / packaging
 .Python
 build/
