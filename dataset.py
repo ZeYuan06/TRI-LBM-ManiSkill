@@ -5,11 +5,17 @@ from tqdm import tqdm
 import numpy as np
 import torch
 from torch.utils.data.dataset import Dataset
+from concurrent.futures import ProcessPoolExecutor
+from mani_skill.utils.geometry.rotation_conversions import (
+    quaternion_to_matrix,
+    matrix_to_axis_angle,
+)
 
 
-def debug_visualize_image(img_hwc: np.ndarray, save_path: str = "debug_check.png"):
+def debug_visualize_image(img_chw: np.ndarray, save_path: str = "debug_check.png"):
     import matplotlib.pyplot as plt
 
+    img_hwc = np.transpose(img_chw, (1, 2, 0))
     plt.figure(figsize=(6, 6))
     plt.imshow(img_hwc)
     plt.title(f"Debug Frame")
@@ -20,8 +26,52 @@ def debug_visualize_image(img_hwc: np.ndarray, save_path: str = "debug_check.png
     print(f"[DEBUG] Saved visualization to {save_path}")
 
 
+def load_single_episode(fpath):
+    """
+    Independent loading function, lightweight, only performs I/O and Numpy Reshape
+    """
+    with open(fpath, "rb") as f:
+        ep_data = pickle.load(f)
+
+    actions = ep_data["actions"]  # (L, A)
+    base_rgb = ep_data["base_rgb"]  # uint8 (L, H, W, 3)
+    wrist_rgb = ep_data["wrist_rgb"]  # uint8
+    traj_state = ep_data["states"]
+
+    obj_name = ep_data.get("object", "object")
+    if isinstance(obj_name, str):
+        parts = obj_name.split("_")
+        if len(parts) > 1 and parts[0].isdigit():
+            obj_name = " ".join(parts[1:])
+        else:
+            obj_name = obj_name.replace("_", " ")
+
+    # Padding L -> L+1
+    base_rgb = np.concatenate([base_rgb, base_rgb[-1:]], axis=0)
+    wrist_rgb = np.concatenate([wrist_rgb, wrist_rgb[-1:]], axis=0)
+    traj_state = np.concatenate([traj_state, traj_state[-1:]], axis=0)
+
+    # NHWC -> NCHW (Numpy Transpose)
+    base_rgb = np.transpose(base_rgb, (0, 3, 1, 2))
+    wrist_rgb = np.transpose(wrist_rgb, (0, 3, 1, 2))
+
+    obs_dict = {
+        "base_rgb": base_rgb,  # uint8
+        "wrist_rgb": wrist_rgb,  # uint8
+        "state": traj_state,  # float64/32
+    }
+
+    return obs_dict, actions, {"instruction": f"pick up the {obj_name}"}
+
+
 class RamenNormalizer:
-    def __init__(self, data, norm_dims=[0, 1, 2], gripper_dim=9):
+    def __init__(
+        self,
+        data=None,
+        norm_dims: list[int] = [0, 1, 2],
+        gripper_dim: int = 9,
+        state_dict=None,
+    ):
         """
         Ramen Normalizer with special handling for Gripper.
 
@@ -29,9 +79,17 @@ class RamenNormalizer:
             norm_dims: List of dimensions for Ramen Normalization (Pos: 0, 1, 2)
             gripper_dim: Index for Gripper dimension (Simple MinMax)
         """
+        if state_dict is not None:
+            self.load_state_dict(state_dict)
+            return
+
+        if data is None:
+            raise ValueError("Data must be provided for RamenNormalizer initialization")
+
         self.norm_dims = norm_dims
         self.gripper_dim = gripper_dim
 
+        data = data.to("cpu")
         self.T = data.shape[1]
         self.D = data.shape[2]
 
@@ -120,9 +178,141 @@ class RamenNormalizer:
 
         return x_unnorm
 
+    def state_dict(self):
+        """Export state as simple python types/numpy for safe checkpointing"""
+        return {
+            "norm_dims": self.norm_dims,
+            "gripper_dim": self.gripper_dim,
+            "x_02": self.x_02.cpu()
+            .numpy()
+            .tolist(),  # Save as list for max compatibility
+            "x_98": self.x_98.cpu().numpy().tolist(),
+            "gripper_min": float(self.gripper_min.cpu().item()),
+            "gripper_max": float(self.gripper_max.cpu().item()),
+        }
+
+    def load_state_dict(self, state):
+        """Restore state from dict"""
+        self.norm_dims = state["norm_dims"]
+        self.gripper_dim = state["gripper_dim"]
+
+        # Restore Tensors
+        self.x_02 = torch.tensor(state["x_02"])
+        self.x_98 = torch.tensor(state["x_98"])
+        self.gripper_min = torch.tensor(state["gripper_min"])
+        self.gripper_max = torch.tensor(state["gripper_max"])
+
+        # Aux params
+        self.T = self.x_02.shape[0]
+        self.D = self.x_02.shape[1]
+
+
+class StandardNormalizer:
+    def __init__(
+        self,
+        data=None,
+        norm_dims: list[int] = [0, 1, 2, 3, 4, 5],
+        gripper_dim: int = 6,
+        state_dict=None,
+    ):
+        if state_dict is not None:
+            self.load_state_dict(state_dict)
+            return
+
+        if data is None:
+            raise ValueError("Data required for initialization")
+
+        self.norm_dims = norm_dims
+        self.gripper_dim = gripper_dim
+
+        data_cpu = data.to("cpu").float()
+
+        # Z-score Stats for Continuous Dims
+        # data shape: (N, T, D) -> flatten to (N*T, D)
+        flat_data = data_cpu.reshape(-1, data_cpu.shape[-1])
+
+        self.mean = torch.mean(flat_data[:, norm_dims], dim=0)  # (len(norm_dims),)
+        self.std = torch.std(flat_data[:, norm_dims], dim=0)  # (len(norm_dims),)
+
+        self.std[self.std < 1e-6] = 1.0
+
+        # MinMax Stats for Gripper
+        gripper_data = flat_data[:, gripper_dim]
+        self.gripper_min = torch.min(gripper_data)
+        self.gripper_max = torch.max(gripper_data)
+
+        if self.gripper_max - self.gripper_min < 1e-6:
+            self.gripper_max += 1.0
+
+        print(
+            f"[StandardNormalizer] Init. Mean: {self.mean[:3]}..., Std: {self.std[:3]}..."
+        )
+
+    def normalize(self, x):
+        x_norm = x.clone()
+        device = x.device
+
+        # Z-score: (x - u) / std
+        if len(self.norm_dims) > 0:
+            target = x[..., self.norm_dims]
+            mean = self.mean.to(device)
+            std = self.std.to(device)
+            x_norm[..., self.norm_dims] = (target - mean) / std
+
+        # Gripper: Map to [-1, 1]
+        if self.gripper_dim is not None:
+            g_target = x[..., self.gripper_dim]
+            g_min = self.gripper_min.to(device)
+            g_max = self.gripper_max.to(device)
+            x_norm[..., self.gripper_dim] = (
+                2.0 * (g_target - g_min) / (g_max - g_min) - 1.0
+            )
+
+        return x_norm
+
+    def unnormalize(self, x):
+        x_unnorm = x.clone()
+        device = x.device
+
+        # Un-Z-score: x * std + u
+        if len(self.norm_dims) > 0:
+            target = x[..., self.norm_dims]
+            mean = self.mean.to(device)
+            std = self.std.to(device)
+            x_unnorm[..., self.norm_dims] = target * std + mean
+
+        # Un-Gripper
+        if self.gripper_dim is not None:
+            g_target = x[..., self.gripper_dim]
+            g_min = self.gripper_min.to(device)
+            g_max = self.gripper_max.to(device)
+            x_unnorm[..., self.gripper_dim] = (g_target + 1.0) / 2.0 * (
+                g_max - g_min
+            ) + g_min
+
+        return x_unnorm
+
+    def state_dict(self):
+        return {
+            "norm_dims": self.norm_dims,
+            "gripper_dim": self.gripper_dim,
+            "mean": self.mean.cpu().numpy().tolist(),
+            "std": self.std.cpu().numpy().tolist(),
+            "gripper_min": float(self.gripper_min.cpu().item()),
+            "gripper_max": float(self.gripper_max.cpu().item()),
+        }
+
+    def load_state_dict(self, state):
+        self.norm_dims = state["norm_dims"]
+        self.gripper_dim = state["gripper_dim"]
+        self.mean = torch.tensor(state["mean"])
+        self.std = torch.tensor(state["std"])
+        self.gripper_min = torch.tensor(state["gripper_min"])
+        self.gripper_max = torch.tensor(state["gripper_max"])
+
 
 class MultiViewDataset(Dataset):
-    def __init__(self, data_path, num_traj):
+    def __init__(self, data_path, num_traj, stats_path=None):
         """
         paper config:
         obs_horizon = 2
@@ -131,6 +321,9 @@ class MultiViewDataset(Dataset):
         # --- Paper Constraints ---
         self.obs_horizon = 2
         self.pred_horizon = 16
+
+        self.mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1)
+        self.std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1)
         print(
             f"Dataset Params Locked: Obs Horizon={self.obs_horizon}, Pred Horizon={self.pred_horizon}"
         )
@@ -143,216 +336,179 @@ class MultiViewDataset(Dataset):
         if num_traj is not None:
             files = files[:num_traj]
 
-        for fpath in tqdm(files, desc="Loading episodes"):
-            with open(fpath, "rb") as f:
-                ep_data = pickle.load(f)
+        print(f"Loading {len(files)} files in parallel...")
+        with ProcessPoolExecutor(max_workers=16) as executor:
+            results = list(
+                tqdm(executor.map(load_single_episode, files), total=len(files))
+            )
 
-            # Load Absolute Raw Data
-            actions = ep_data["actions"]  # (L, A)
-            base_rgb = ep_data["base_rgb"]
-            wrist_rgb = ep_data["wrist_rgb"]
-            traj_state = ep_data["states"]
-            obj_name = ep_data.get("object", "object")
-            if isinstance(obj_name, str):
-                parts = obj_name.split("_")
-                if len(parts) > 1 and parts[0].isdigit():
-                    obj_name = " ".join(parts[1:])
-                else:
-                    obj_name = obj_name.replace("_", " ")
-
-            # Padding L -> L+1
-            base_rgb = np.concatenate([base_rgb, base_rgb[-1:]], axis=0)
-            wrist_rgb = np.concatenate([wrist_rgb, wrist_rgb[-1:]], axis=0)
-            traj_state = np.concatenate([traj_state, traj_state[-1:]], axis=0)
-
-            # Transpose Images
-            base_rgb = base_rgb.astype(np.float32) / 255.0
-            wrist_rgb = wrist_rgb.astype(np.float32) / 255.0
-            base_rgb = np.transpose(base_rgb, (0, 3, 1, 2))
-            wrist_rgb = np.transpose(wrist_rgb, (0, 3, 1, 2))
-
-            obs_dict = {
-                "base_rgb": base_rgb,
-                "wrist_rgb": wrist_rgb,
-                "state": traj_state,  # Absolute Pose
-            }
-            meta_dict = {"instruction": f"pick up the {obj_name}"}
-
-            trajectories["observations"].append(obs_dict)
-            trajectories["actions"].append(actions)  # Absolute Pose
-            trajectories["meta"].append(meta_dict)
-
-        print("Data loaded. Converting to Tensor...")
-
-        # Tensor Conversion
+        print("Converting to Tensor (Keeping uint8 for images)...")
         obs_traj_dict_list = []
-        for _obs_traj_dict in trajectories["observations"]:
-            _obs_traj_dict["base_rgb"] = torch.from_numpy(_obs_traj_dict["base_rgb"])
-            _obs_traj_dict["wrist_rgb"] = torch.from_numpy(_obs_traj_dict["wrist_rgb"])
-            _obs_traj_dict["state"] = torch.from_numpy(_obs_traj_dict["state"])
-            obs_traj_dict_list.append(_obs_traj_dict)
-        trajectories["observations"] = obs_traj_dict_list
+        for obs_dict, actions, meta in results:
+            obs_dict["base_rgb"] = torch.from_numpy(obs_dict["base_rgb"])
+            obs_dict["wrist_rgb"] = torch.from_numpy(obs_dict["wrist_rgb"])
+            obs_dict["state"] = torch.from_numpy(obs_dict["state"]).float()
 
-        for i in range(len(trajectories["actions"])):
-            trajectories["actions"][i] = torch.Tensor(trajectories["actions"][i])
+            obs_traj_dict_list.append(obs_dict)
+            trajectories["actions"].append(torch.from_numpy(actions).float())
+            trajectories["meta"].append(meta)
+
+        trajectories["observations"] = obs_traj_dict_list
 
         # Prepare Slicing & Padding Config
         self.slices = []
+        pad_before = self.obs_horizon - 1
         num_traj = len(trajectories["actions"])
-
         for traj_idx in range(num_traj):
             L = trajectories["actions"][traj_idx].shape[0]
-            pad_before = self.obs_horizon - 1
-            pad_after = self.pred_horizon - self.obs_horizon
-            self.slices += [
-                (traj_idx, start, start + self.pred_horizon)
-                for start in range(-pad_before, L - self.pred_horizon + pad_after)
-            ]
+            for start in range(-pad_before, L):
+                self.slices.append((traj_idx, start))
 
         self.trajectories = trajectories
 
-        # -Ramen Normalization Preparation (Relativize Data for Stats)
-        print("Pre-calculating Delta Actions for Ramen Normalization...")
+        if stats_path is not None and os.path.exists(stats_path):
+            print(f"Loading pre-computed normalizer stats from {stats_path}...")
+            state_dict = torch.load(stats_path)
+            self.action_normalizer = StandardNormalizer(state_dict=state_dict["action"])
+            self.state_normalizer = StandardNormalizer(state_dict=state_dict["state"])
+            return
+
+        # Ramen Normalization Preparation (Relativize Data for Stats)
+        print("Calculating Delta Actions for Ramen Normalization...")
 
         # Sampling strategy to avoid OOM
         sample_size = min(10000, len(self.slices))
         sample_indices = np.random.choice(len(self.slices), sample_size, replace=False)
 
         delta_actions_cache = []
+        states_cache = []
 
         for idx in tqdm(sample_indices, desc="Computing Norm Stats"):
-            traj_idx, start, end = self.slices[idx]
-            L = self.trajectories["actions"][traj_idx].shape[0]
+            raw_sample = self._get_raw_sample(idx)
 
-            # Get Absolute Action Sequence
-            act_seq_abs = self.trajectories["actions"][traj_idx][
-                max(0, start) : end
-            ].float()
+            # raw_sample: {'act_seq_delta': ..., 'state_abs': ...}
+            delta_actions_cache.append(raw_sample["act_seq_delta"])
+            states_cache.append(raw_sample["state_seq_abs"])
 
-            # Pad logic (simplified just for stats)
-            if start < 0:
-                act_seq_abs = torch.cat(
-                    [act_seq_abs[0].unsqueeze(0).repeat(-start, 1), act_seq_abs], dim=0
-                )
-            if end > L:
-                # Replicate last (Absolute Pose Padding)
-                last_frame = act_seq_abs[-1]
-                act_seq_abs = torch.cat(
-                    [act_seq_abs, last_frame.unsqueeze(0).repeat(end - L, 1)], dim=0
-                )
-
-            # Keep consistent length
-            act_seq_abs = act_seq_abs[: self.pred_horizon]
-
-            # Get Current Observation State (Reference Base)
-            # Last frame of observation window
-            curr_obs_idx = start + self.obs_horizon - 1
-            if curr_obs_idx < 0:
-                curr_obs_idx = 0
-            if curr_obs_idx >= L:
-                curr_obs_idx = L - 1
-            curr_state_abs = self.trajectories["observations"][traj_idx]["state"][
-                curr_obs_idx
-            ].float()
-
-            # Compute Delta (Action Relativization)
-            # Pos (0-3) -> Relative; Rot (3-9) -> Absolute; Gripper (9) -> Absolute
-            act_seq_delta = act_seq_abs.clone()
-            act_seq_delta[:, :3] = act_seq_abs[:, :3] - curr_state_abs[:3]
-
-            delta_actions_cache.append(act_seq_delta)
-
-        all_delta_actions = torch.stack(delta_actions_cache)  # (N_samples, Pred_T, Dim)
-
-        # States are normalized as Absolutes
-        all_states_abs = torch.cat(
-            [self.trajectories["observations"][i]["state"] for i in range(num_traj)],
-            dim=0,
-        ).unsqueeze(
-            1
-        )  # (Total_L, 1, D) for compat with Ramen
+        all_delta_actions = torch.stack(delta_actions_cache)  # (N, Pred_T, D)
+        all_states = torch.stack(states_cache)  # (N, Obs_T, D)
 
         # Initialize Normalizers:
-        # Action:
-        #   - Pos(0,1,2): Ramen
-        #   - Rot(3-8): Skip (None)
-        #   - Gripper(9): MinMax
-        self.action_normalizer = RamenNormalizer(
+        self.action_normalizer = StandardNormalizer(
             all_delta_actions,
-            norm_dims=[0, 1, 2],  # Only Pos uses percentile
-            gripper_dim=9,  # Gripper uses MinMax
+            norm_dims=[0, 1, 2, 3, 4, 5],
+            gripper_dim=6,  # Gripper uses MinMax
         )
 
         # State: Same logic
-        self.state_normalizer = RamenNormalizer(
-            all_states_abs, norm_dims=[0, 1, 2], gripper_dim=9
+        self.state_normalizer = StandardNormalizer(
+            all_states, norm_dims=[0, 1, 2, 3, 4, 5, 7], gripper_dim=7
         )
 
-        del delta_actions_cache, all_delta_actions, all_states_abs
+        if stats_path is not None:
+            print(f"Saving normalizer stats to {stats_path}...")
+            torch.save(
+                {
+                    "action": self.action_normalizer.state_dict(),
+                    "state": self.state_normalizer.state_dict(),
+                },
+                stats_path,
+            )
+
+        del delta_actions_cache, all_delta_actions, all_states
 
     def get_normalizers(self):
         return self.state_normalizer, self.action_normalizer
 
-    def __getitem__(self, index):
-        traj_idx, start, end = self.slices[index]
-        L, act_dim = self.trajectories["actions"][traj_idx].shape
-
-        # --- 1. Load Observation ---
+    def _get_raw_sample(self, index):
+        """
+        Internal helper to extract Raw Quantities given an index.
+        Used by both __getitem__ and stats computation to ensure perfect alignment.
+        """
+        traj_idx, start = self.slices[index]
         obs_traj = self.trajectories["observations"][traj_idx]
-        obs_seq = {}
-        # Slicing obs
-        for k, v in obs_traj.items():
-            obs_seq[k] = v[max(0, start) : start + self.obs_horizon]
-            if start < 0:
-                pad_obs_seq = torch.stack([obs_seq[k][0]] * abs(start), dim=0)
-                obs_seq[k] = torch.cat((pad_obs_seq, obs_seq[k]), dim=0)
+        act_traj = self.trajectories["actions"][traj_idx]
+        L = act_traj.shape[0]
 
-        # --- 2. Load Action (Absolute) ---
-        act_seq_abs = self.trajectories["actions"][traj_idx][max(0, start) : end]
+        # Observation Extraction
+        # Range: [start : start + obs_horizon]
+        obs_indices = np.arange(start, start + self.obs_horizon)
+        # Handle Padding Indicies
+        clamped_indices = np.clip(obs_indices, 0, L - 1)
+        # Retrieve State
+        state_seq_abs = obs_traj["state"][clamped_indices]  # (Obs_T, D)
+        # Action Extraction
+        current_time_idx = start + self.obs_horizon - 1
+        # Prediction Window: [current_time_idx : current_time_idx + pred_horizon]
+        act_end_idx = current_time_idx + self.pred_horizon
 
-        # Padding
-        if start < 0:
-            # FIX: Use unsqueeze for safety to match __init__ logic
-            act_seq_abs = torch.cat(
-                [act_seq_abs[0].unsqueeze(0).repeat(-start, 1), act_seq_abs], dim=0
-            )
-        if end > L:
-            # FIX: Removed reference to undefined self.pad_action_arm
-            # Now replicates the last frame (Absolute Pose padding)
-            last_frame = act_seq_abs[-1]
-            act_seq_abs = torch.cat(
-                [act_seq_abs, last_frame.unsqueeze(0).repeat(end - L, 1)], dim=0
-            )
+        act_indices = np.arange(current_time_idx, act_end_idx)
+        clamped_act_indices = np.clip(act_indices, 0, L - 1)
+        act_seq_abs = act_traj[clamped_act_indices]  # (Pred_T, D)
+        # Relativization
+        # Reference is Current State (Last frame of obs)
+        curr_state_abs = state_seq_abs[-1]  # Shape (D,)
 
-        assert obs_seq["state"].shape[0] == self.obs_horizon
-        assert act_seq_abs.shape[0] == self.pred_horizon
+        # Delta Translation (0, 1, 2)
+        act_pos_delta = act_seq_abs[:, :3] - curr_state_abs[:3]
 
-        # --- 3. Relativization & Normalization ---
-        # Get Reference Pose (Current Frame State)
-        current_state_abs = obs_seq["state"][-1].clone()
+        # Delta Rotation
+        curr_quat = curr_state_abs[3:7]  # (4,)
+        act_quats = act_seq_abs[:, 3:7]  # (Pred_T, 4)
 
-        # Action -> Delta (Position Only)
-        act_seq_delta = act_seq_abs.clone()
-        act_seq_delta[:, :3] = act_seq_abs[:, :3] - current_state_abs[:3]
+        curr_rot_mat = quaternion_to_matrix(curr_quat)  # (3, 3)
+        act_rot_mat = quaternion_to_matrix(act_quats)  # (Pred_T, 3, 3)
 
-        # Normalize State (Abs -> Norm Abs)
-        # Add dim for Ramen (T=1), remove after
-        obs_seq["state"] = self.state_normalizer.normalize(
-            obs_seq["state"].unsqueeze(0)
-        ).squeeze(0)
+        # R_rel = R_curr^(-1) * R_act
+        curr_rot_mat_inv = curr_rot_mat.transpose(-1, -2).unsqueeze(0)  # (1, 3, 3)
 
-        # Normalize Action (Delta -> Norm Delta)
-        norm_action = self.action_normalizer.normalize(
-            act_seq_delta.unsqueeze(0)
-        ).squeeze(0)
+        rel_rot_mat = torch.matmul(curr_rot_mat_inv, act_rot_mat)  # (Pred_T, 3, 3)
+        act_rot_delta_aa = matrix_to_axis_angle(rel_rot_mat)  # (Pred_T, 3)
 
-        # --- 4. Get Instruction ---
-        instruction = self.trajectories["meta"][traj_idx]["instruction"]
+        # Target Gripper Action
+        gripper_act = act_seq_abs[:, 7:8]  # (Pred_T, 1)
+
+        act_seq_delta = torch.cat(
+            [act_pos_delta, act_rot_delta_aa, gripper_act], dim=-1
+        )
 
         return {
-            "observations": obs_seq,
+            "traj_idx": traj_idx,
+            "obs_indices": clamped_indices,  # For image loading
+            "state_seq_abs": state_seq_abs,
+            "act_seq_abs": act_seq_abs,
+            "act_seq_delta": act_seq_delta,
+            "instruction": self.trajectories["meta"][traj_idx]["instruction"],
+        }
+
+    def __getitem__(self, index):
+        raw = self._get_raw_sample(index)
+
+        traj_idx = raw["traj_idx"]
+        obs_indices = raw["obs_indices"]
+        obs_traj = self.trajectories["observations"][traj_idx]
+        base_rgb = obs_traj["base_rgb"][obs_indices]
+        wrist_rgb = obs_traj["wrist_rgb"][obs_indices]
+
+        base_rgb = (base_rgb.float() / 255.0 - self.mean) / self.std
+        wrist_rgb = (wrist_rgb.float() / 255.0 - self.mean) / self.std
+
+        # Normalize State and Action
+        norm_state = self.state_normalizer.normalize(
+            raw["state_seq_abs"].unsqueeze(0)
+        ).squeeze(0)
+
+        norm_action = self.action_normalizer.normalize(
+            raw["act_seq_delta"].unsqueeze(0)
+        ).squeeze(0)
+
+        # Construct Obs Dict
+        obs_dict = {"base_rgb": base_rgb, "wrist_rgb": wrist_rgb, "state": norm_state}
+
+        return {
+            "observations": obs_dict,
             "actions": norm_action,
-            "instruction": instruction,
+            "instruction": raw["instruction"],
         }
 
     def __len__(self):
@@ -365,7 +521,7 @@ if __name__ == "__main__":
     print("Running Dataset Integrity Test")
     print("=" * 50 + "\n")
 
-    # 1. Generate Dummy Data
+    # Generate Dummy Data
     temp_dir = "./debug_data"
     print(f"Creating temp data at: {temp_dir}")
 
@@ -378,7 +534,7 @@ if __name__ == "__main__":
         print("Dataset initialized successfully.")
         print(f"Total Slices: {len(dataset)}")
 
-        # 3. Test __getitem__
+        # Test __getitem__
         print("\nTesting item retrieval (idx=0)...")
         sample = dataset[0]
 
@@ -391,8 +547,8 @@ if __name__ == "__main__":
         print(f"-> State Shape: {obs['state'].shape} (Expected: 2, 10)")
         print(f"-> RGB Shape: {obs['base_rgb'].shape} (Expected: 2, 3, 128, 128)")
 
-        assert actions.shape == (16, 10), "Action shape mismatch!"
-        assert obs["state"].shape == (2, 10), "State shape mismatch!"
+        assert actions.shape == (16, 7), "Action shape mismatch!"
+        assert obs["state"].shape == (2, 8), "State shape mismatch!"
 
         print("\nAll checks passed! Dataset logic is robust.")
 

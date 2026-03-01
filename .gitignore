@@ -6,9 +6,12 @@ __pycache__/
 # C extensions
 *.so
 
+wandb/
+rollout_videos/
 debug_data/
 data/
 checkpoints/
+checkpoints_pl/
 .vscode/
 YCB_processed/
 
