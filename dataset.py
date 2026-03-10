@@ -46,11 +46,6 @@ def load_single_episode(fpath):
         else:
             obj_name = obj_name.replace("_", " ")
 
-    # Padding L -> L+1
-    base_rgb = np.concatenate([base_rgb, base_rgb[-1:]], axis=0)
-    wrist_rgb = np.concatenate([wrist_rgb, wrist_rgb[-1:]], axis=0)
-    traj_state = np.concatenate([traj_state, traj_state[-1:]], axis=0)
-
     # NHWC -> NCHW (Numpy Transpose)
     base_rgb = np.transpose(base_rgb, (0, 3, 1, 2))
     wrist_rgb = np.transpose(wrist_rgb, (0, 3, 1, 2))
@@ -122,6 +117,8 @@ class RamenNormalizer:
                 )
                 self.x_02[t, norm_dims] = q_vals[0]
                 self.x_98[t, norm_dims] = q_vals[1]
+
+        return
 
     def normalize(self, x):
         """
@@ -244,9 +241,7 @@ class StandardNormalizer:
         if self.gripper_max - self.gripper_min < 1e-6:
             self.gripper_max += 1.0
 
-        print(
-            f"[StandardNormalizer] Init. Mean: {self.mean[:3]}..., Std: {self.std[:3]}..."
-        )
+        print(f"[StandardNormalizer] Init. Mean: {self.mean}, Std: {self.std}")
 
     def normalize(self, x):
         x_norm = x.clone()
@@ -369,8 +364,8 @@ class MultiViewDataset(Dataset):
         if stats_path is not None and os.path.exists(stats_path):
             print(f"Loading pre-computed normalizer stats from {stats_path}...")
             state_dict = torch.load(stats_path)
-            self.action_normalizer = StandardNormalizer(state_dict=state_dict["action"])
-            self.state_normalizer = StandardNormalizer(state_dict=state_dict["state"])
+            self.action_normalizer = RamenNormalizer(state_dict=state_dict["action"])
+            self.state_normalizer = RamenNormalizer(state_dict=state_dict["state"])
             return
 
         # Ramen Normalization Preparation (Relativize Data for Stats)
@@ -394,15 +389,15 @@ class MultiViewDataset(Dataset):
         all_states = torch.stack(states_cache)  # (N, Obs_T, D)
 
         # Initialize Normalizers:
-        self.action_normalizer = StandardNormalizer(
+        self.action_normalizer = RamenNormalizer(
             all_delta_actions,
-            norm_dims=[0, 1, 2, 3, 4, 5],
-            gripper_dim=6,  # Gripper uses MinMax
+            norm_dims=list(range(3)),  # Pos + Rotation
+            gripper_dim=9,  # Gripper uses MinMax
         )
 
         # State: Same logic
-        self.state_normalizer = StandardNormalizer(
-            all_states, norm_dims=[0, 1, 2, 3, 4, 5, 7], gripper_dim=7
+        self.state_normalizer = RamenNormalizer(
+            all_states, norm_dims=list(range(3)), gripper_dim=9
         )
 
         if stats_path is not None:
@@ -421,60 +416,38 @@ class MultiViewDataset(Dataset):
         return self.state_normalizer, self.action_normalizer
 
     def _get_raw_sample(self, index):
-        """
-        Internal helper to extract Raw Quantities given an index.
-        Used by both __getitem__ and stats computation to ensure perfect alignment.
-        """
         traj_idx, start = self.slices[index]
         obs_traj = self.trajectories["observations"][traj_idx]
         act_traj = self.trajectories["actions"][traj_idx]
         L = act_traj.shape[0]
 
-        # Observation Extraction
-        # Range: [start : start + obs_horizon]
+        # State Extraction
         obs_indices = np.arange(start, start + self.obs_horizon)
-        # Handle Padding Indicies
-        clamped_indices = np.clip(obs_indices, 0, L - 1)
-        # Retrieve State
-        state_seq_abs = obs_traj["state"][clamped_indices]  # (Obs_T, D)
+        clamped_obs_indices = np.clip(obs_indices, 0, L - 1)
+        state_seq_abs = obs_traj["state"][clamped_obs_indices]  # (2, 10)
+
         # Action Extraction
         current_time_idx = start + self.obs_horizon - 1
-        # Prediction Window: [current_time_idx : current_time_idx + pred_horizon]
         act_end_idx = current_time_idx + self.pred_horizon
-
         act_indices = np.arange(current_time_idx, act_end_idx)
         clamped_act_indices = np.clip(act_indices, 0, L - 1)
-        act_seq_abs = act_traj[clamped_act_indices]  # (Pred_T, D)
-        # Relativization
-        # Reference is Current State (Last frame of obs)
-        curr_state_abs = state_seq_abs[-1]  # Shape (D,)
 
-        # Delta Translation (0, 1, 2)
-        act_pos_delta = act_seq_abs[:, :3] - curr_state_abs[:3]
+        act_seq_abs = act_traj[clamped_act_indices]  # (16, 10)
+        curr_state_abs = state_seq_abs[-1]  # (10,)
 
-        # Delta Rotation
-        curr_quat = curr_state_abs[3:7]  # (4,)
-        act_quats = act_seq_abs[:, 3:7]  # (Pred_T, 4)
+        # Action Pos [0:3] - Current State Pos [0:3]
+        act_pos_delta = act_seq_abs[:, :3] - curr_state_abs[:3]  # (16, 3)
 
-        curr_rot_mat = quaternion_to_matrix(curr_quat)  # (3, 3)
-        act_rot_mat = quaternion_to_matrix(act_quats)  # (Pred_T, 3, 3)
+        # Absolute Rotation 6D
+        act_rot_6d_abs = act_seq_abs[:, 3:9]  # (16, 6)
 
-        # R_rel = R_curr^(-1) * R_act
-        curr_rot_mat_inv = curr_rot_mat.transpose(-1, -2).unsqueeze(0)  # (1, 3, 3)
-
-        rel_rot_mat = torch.matmul(curr_rot_mat_inv, act_rot_mat)  # (Pred_T, 3, 3)
-        act_rot_delta_aa = matrix_to_axis_angle(rel_rot_mat)  # (Pred_T, 3)
-
-        # Target Gripper Action
-        gripper_act = act_seq_abs[:, 7:8]  # (Pred_T, 1)
-
-        act_seq_delta = torch.cat(
-            [act_pos_delta, act_rot_delta_aa, gripper_act], dim=-1
-        )
+        # Absolute Gripper
+        act_gripper = act_seq_abs[:, 9:10]  # (16, 1)
+        act_seq_delta = torch.cat([act_pos_delta, act_rot_6d_abs, act_gripper], dim=-1)
 
         return {
             "traj_idx": traj_idx,
-            "obs_indices": clamped_indices,  # For image loading
+            "obs_indices": clamped_obs_indices,  # For image loading
             "state_seq_abs": state_seq_abs,
             "act_seq_abs": act_seq_abs,
             "act_seq_delta": act_seq_delta,

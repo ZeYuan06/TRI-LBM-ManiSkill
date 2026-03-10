@@ -4,7 +4,7 @@ from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 from pytorch_lightning.loggers import WandbLogger
 import torch
 
-from TRI_LBM.pl_model import LBMLightningModule
+from TRI_LBM.pl_model import LBMLightningModule, EMACallback
 from pl_data import LBMDataModule
 
 torch.set_float32_matmul_precision("high")
@@ -16,7 +16,7 @@ def get_args():
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--epochs", type=int, default=150)
-    parser.add_argument("--num_workers", type=int, default=8)
+    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument(
         "--devices", type=str, default="1"
     )  # Can be int or comma-separated list of GPU IDs
@@ -67,13 +67,22 @@ def main():
         action_norm_params=dm.action_norm.state_dict(),
     )
 
-    checkpoint_callback = ModelCheckpoint(
+    checkpoint_callback_base = ModelCheckpoint(
         dirpath=args.save_dir,
-        filename="{epoch:02d}-{valloss:.4f}",
-        save_top_k=2,
+        filename="base-{epoch:02d}-{val_loss:.4f}",
         monitor="val/loss",
+        save_top_k=5,
         mode="min",
         save_last=True,
+    )
+
+    checkpoint_callback_ema = ModelCheckpoint(
+        dirpath=args.save_dir,
+        filename="ema-{epoch:02d}-{val_ema_loss:.4f}",
+        monitor="val/ema_loss",
+        save_top_k=5,
+        mode="min",
+        save_last=False,
     )
 
     epoch_checkpoint = ModelCheckpoint(
@@ -82,6 +91,8 @@ def main():
         every_n_epochs=args.rollout_freq,
         save_top_k=-1,
     )
+
+    ema_callback = EMACallback()
 
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
@@ -108,7 +119,7 @@ def main():
         precision="bf16-mixed",
         max_epochs=args.epochs,
         logger=logger,
-        callbacks=[checkpoint_callback, epoch_checkpoint, lr_monitor],
+        callbacks=[checkpoint_callback_base, checkpoint_callback_ema, epoch_checkpoint, ema_callback, lr_monitor],
         check_val_every_n_epoch=args.eval_freq,
         log_every_n_steps=10,
         sync_batchnorm=True,

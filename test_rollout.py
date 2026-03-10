@@ -3,7 +3,7 @@ import torch
 import os
 
 from TRI_LBM.pl_model import LBMLightningModule
-from dataset import StandardNormalizer
+from dataset import RamenNormalizer
 from eval_utils import evaluate_rollout
 
 
@@ -14,6 +14,9 @@ def get_test_args():
     parser = argparse.ArgumentParser(description="Test TRI-LBM Rollout")
     parser.add_argument(
         "--ckpt", type=str, required=True, help="Path to checkpoint .pt file"
+    )
+    parser.add_argument(
+        "--use_ema", action="store_true", help="Use EMA weights for rollout"
     )
     parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu"
@@ -35,11 +38,24 @@ def main():
         raise FileNotFoundError(f"Checkpoint not found: {args.ckpt}")
     print(f"Loading PL checkpoint: {args.ckpt}")
 
-    pl_module = LBMLightningModule.load_from_checkpoint(args.ckpt, map_location=device)
+    pl_module = LBMLightningModule.load_from_checkpoint(
+        args.ckpt, map_location=device, strict=False
+    )
     pl_module.eval()
     pl_module.freeze()
 
     model = pl_module.model.to(device)
+    if args.use_ema:
+        print("[Rollout] Attempting to load EMA weights...")
+        checkpoint = torch.load(args.ckpt, map_location=device)
+
+        if "ema_state_dict" not in checkpoint:
+            raise KeyError(
+                "EMA state dict not found in checkpoint! Make sure you used the new Callback to save EMA weights."
+            )
+
+        print("[Rollout] Found 'ema_state_dict' in checkpoint. Loading...")
+        model.load_state_dict(checkpoint["ema_state_dict"])
 
     state_norm_params = pl_module.hparams.state_norm_params
     action_norm_params = pl_module.hparams.action_norm_params
@@ -50,8 +66,8 @@ def main():
         )
 
     print("Restoring Normalizers from checkpoint...")
-    state_norm = StandardNormalizer(state_dict=state_norm_params)
-    action_norm = StandardNormalizer(state_dict=action_norm_params)
+    state_norm = RamenNormalizer(state_dict=state_norm_params)
+    action_norm = RamenNormalizer(state_dict=action_norm_params)
 
     obs_horizon = pl_module.hparams.num_image_frames
 

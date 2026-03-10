@@ -351,16 +351,14 @@ class PickBoxEnv(BaseEnv):
 
         self.agent.robot.set_qpos(self.agent.keyframes["home"].qpos)
         self.agent.robot.set_pose(self.agent.keyframes["home"].pose)
-        if self.robot_uids == UR10eRobotiq.uid:
-            self.home_tcp_pose = torch.tensor(
-                [-0.0086, 0.0741, 0.7239], device=self.device
-            ).repeat(b, 1)
-        elif self.robot_uids == WidowX250S.uid:
-            self.home_tcp_pose = torch.tensor(
-                [0.0583, 0, 0.3606], device=self.device
-            ).repeat(b, 1)
-        else:
-            raise NotImplementedError("Unsupported robot for home tcp pose")
+        if getattr(self, "home_tcp_pose", None) is None:
+            if self.robot_uids == UR10eRobotiq.uid:
+                base_home = torch.tensor([-0.0086, 0.0741, 0.7239], device=self.device)
+            elif self.robot_uids == WidowX250S.uid:
+                base_home = torch.tensor([0.0583, 0, 0.3606], device=self.device)
+            else:
+                raise NotImplementedError("Unsupported robot for home tcp pose")
+            self.home_tcp_pose = base_home.repeat(self.num_envs, 1)
 
     def _get_obs_extra(self, info: Dict):
         # in reality some people hack is_grasped into observations by checking if the gripper can close fully or not

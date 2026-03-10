@@ -134,12 +134,14 @@ class DiffusionTransformerWrapper(Module):
         self,
         actions,
         times,
-        global_cond_feats,
+        global_cond_feats=None,
     ):
+        if global_cond_feats is None:
+            global_cond_feats = self._temp_cond_feats
         tokens = self.proj_in(actions)
         time_cond = self.to_time_cond(times)
         cond_emb = self.cond_proj(global_cond_feats)
-        final_cond = (cond_emb + time_cond)
+        final_cond = cond_emb + time_cond
 
         attended = self.transformer(
             tokens,
@@ -160,8 +162,8 @@ class LBM(Module):
         dim_head=64,
         heads=12,
         action_chunk_length=16,
-        diffusion_timesteps=1000,
-        diffusion_sampling_timesteps=16,
+        diffusion_timesteps=100,
+        diffusion_sampling_timesteps=100,
         clip_language_model="ViT-B-32",
         language_pretrained_name="laion2b_s34b_b79k",
         clip_image_model="ViT-B-16",
@@ -233,6 +235,7 @@ class LBM(Module):
             timesteps=diffusion_timesteps,
             sampling_timesteps=diffusion_sampling_timesteps,
             channels=action_dim,
+            auto_normalize=False,
             self_condition=False,
             channel_first=False,
         )
@@ -283,7 +286,9 @@ class LBM(Module):
         # Flatten cameras: [B, T, Nc*512]
         image_embeds = rearrange(image_embeds, "b t nc d -> b t (nc d)")
         # Proprioception (Pose)
-        assert pose.shape[1] == t, f"Pose temporal dim {pose.shape[1]} != Image temporal dim {t}"
+        assert (
+            pose.shape[1] == t
+        ), f"Pose temporal dim {pose.shape[1]} != Image temporal dim {t}"
         # Concatenate Per Timestep
         text_embeds_seq = repeat(text_embeds, "b d -> b t d", t=t)
         # [B, T, (Text + Img + Pose)]
@@ -325,10 +330,11 @@ class LBM(Module):
         batch_size = images.shape[0]
 
         # sample actions
+        self.diffusion_transformer._temp_cond_feats = global_cond
         sampled_actions = self.gaussian_diffusion_1d.sample(
             batch_size=batch_size,
-            model_forward_kwargs=dict(global_cond_feats=global_cond),
         )
+        self.diffusion_transformer._temp_cond_feats = None
 
         return sampled_actions
 
@@ -340,7 +346,6 @@ class LBM(Module):
         pose: Tensor,
         actions: Tensor | None = None,
     ):
-
         if not exists(actions):
             return self.sample(text, images, pose)
         self._check_image_shape(images)

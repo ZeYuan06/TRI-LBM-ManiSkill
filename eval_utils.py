@@ -7,11 +7,11 @@ import wandb
 
 from mani_skill.utils.wrappers import RecordEpisode
 from mani_skill.vector.wrappers.gymnasium import ManiSkillVectorEnv
-from mani_skill.utils.structs.pose import Pose
 from mani_skill.utils.geometry.rotation_conversions import (
     quaternion_to_matrix,
     matrix_to_euler_angles,
-    axis_angle_to_matrix,
+    rotation_6d_to_matrix,
+    matrix_to_rotation_6d,
 )
 from agent.widowx_env import PickBoxEnv
 
@@ -40,91 +40,96 @@ class DecoupledPose:
 
     @classmethod
     def from_env_capture(cls, capture_tensor: torch.Tensor):
-        """Parse env capture tensor [x, y, z, qx, qy, qz, qw, gripper]."""
+        """
+        Parse env capture tensor.
+        New Format: [x, y, z, r1...r6, gripper] (10 dims)
+        """
         pos = capture_tensor[:, :3]
-        quat = capture_tensor[:, 3:7]
-        return cls(pos, quaternion_to_matrix(quat))
-
-    def apply_delta(self, delta_pos: torch.Tensor, delta_axis_angle: torch.Tensor):
-        """Compute target = anchor + predicted delta (pos + axis-angle rot)."""
-        new_pos = self.pos + delta_pos
-        rel_rot_mat = axis_angle_to_matrix(delta_axis_angle)
-        new_rot_mat = torch.matmul(self.rot_mat, rel_rot_mat)
-        return DecoupledPose(new_pos, new_rot_mat)
+        rot6d = capture_tensor[:, 3:9]
+        rot_mat = rotation_6d_to_matrix(rot6d)
+        return cls(pos, rot_mat)
 
     def diff_to_env_action(
         self, target_pose: "DecoupledPose"
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return (world_position_delta, local_euler_delta).
+        """Return (world_position_delta, local_euler_delta)."""
+        world_delta_pos = target_pose.pos - self.pos
 
-        Position delta is in world frame. Rotation delta is expressed as
-        local Euler angles: R_local = R_curr^T * R_target.
-        """
-        env_delta_pos = target_pose.pos - self.pos
+        # R_delta * R_curr = R_target
         curr_rot_inv = self.rot_mat.transpose(-1, -2)
-        env_delta_rot_mat = torch.matmul(curr_rot_inv, target_pose.rot_mat)
+        env_delta_rot_mat = torch.matmul(target_pose.rot_mat, curr_rot_inv)
+
         env_delta_euler = matrix_to_euler_angles(env_delta_rot_mat, "XYZ")
-        return env_delta_pos, env_delta_euler
+        return world_delta_pos, env_delta_euler
 
 
 def compute_step_delta_action(
-    anchor: DecoupledPose,
+    anchor_pos: torch.Tensor,
     pred_delta_pos: torch.Tensor,
-    pred_delta_axis_angle: torch.Tensor,
+    pred_rot_6d: torch.Tensor,
     pred_gripper: torch.Tensor,
     curr: DecoupledPose,
     pos_limit: float = 0.05,
     rot_limit: float = 0.15,
 ):
-    """Compute a safe, clipped corrective action that moves current -> predicted target.
-
-    Steps:
-      1) Build absolute target pose = anchor + predicted delta.
-      2) Compute corrective delta from current to target (world position, local Euler).
-      3) Clip position and rotation deltas to provided safety limits and return action.
     """
-    # Absolute target pose from anchor + predicted delta
-    target = anchor.apply_delta(pred_delta_pos, pred_delta_axis_angle)
+    Compute corrective action for PD Controller.
 
-    # Corrective delta to apply in the environment frame
-    env_delta_pos, env_delta_euler = curr.diff_to_env_action(target)
+    Args:
+        anchor_pos: The position at inference time (t=0).
+        pred_delta_pos: Predicted delta relative to anchor_pos.
+        pred_rot_6d: Predicted ABSOLUTE rotation (6D).
+        curr: Sampled current robot pose.
+    """
+    # Calculate Global Target Pose
+    target_pos = anchor_pos + pred_delta_pos
 
-    # Clip position delta elementwise to [-pos_limit, pos_limit]
+    # Target Rot = Absolute Prediction (converted to matrix)
+    target_rot_mat = rotation_6d_to_matrix(pred_rot_6d)
+
+    target_pose = DecoupledPose(target_pos, target_rot_mat)
+
+    # Compute difference between Current Robot Pose and Target Pose
+    # This generates the delta command for the PD controller
+    env_delta_pos, env_delta_euler = curr.diff_to_env_action(target_pose)
+
+    # Clip for safety / stability
     clipped_pos_delta = torch.clamp(env_delta_pos, -pos_limit, pos_limit)
 
-    # Clip rotation delta by limiting its magnitude per sample to rot_limit
     rot_norm = torch.linalg.norm(env_delta_euler, dim=1, keepdim=True)
     scale_factor = torch.ones_like(rot_norm)
     mask = rot_norm > rot_limit
     if mask.any():
         scale_factor[mask] = rot_limit / (rot_norm[mask] + 1e-8)
     clipped_euler_delta = env_delta_euler * scale_factor
+    # clipped_euler_delta = torch.zeros_like(env_delta_euler)
 
-    # Return concatenated action: [dx,dy,dz, droll,dpitch,dyaw, gripper]
     return torch.cat([clipped_pos_delta, clipped_euler_delta, pred_gripper], dim=1)
 
 
 class StateCaptureWrapper(gym.Wrapper):
     def capture_state(self):
-        """Capture current robot state (TCP pose, gripper) directly from agent. Must be called at the correct time!"""
+        """
+        Capture state formatted for model input:
+        [Pos(3), Rot6D(6), Gripper(1)] -> Total 10 Dims
+        """
         env = self.env.unwrapped
 
-        # Get end-effector (TCP) pose (Batch, 7)
+        # TCP Pose
         tcp_pose = env.agent.tcp_pose
         tcp_pos = tcp_pose.p
         tcp_quat = tcp_pose.q
 
-        # rotation_matrix = quaternion_to_matrix(tcp_quat)
+        # Convert Quat -> Matrix -> 6D
+        rot_mat = quaternion_to_matrix(tcp_quat)  # (B, 3, 3)
+        # Use first two columns flattened as 6D representation
+        rot_6d = matrix_to_rotation_6d(rot_mat)  # (B, 6)
 
-        # # 6D rotation representation: first two rows of the rotation matrix
-        # # (Batch, 3, 3) -> (Batch, 2, 3) -> (Batch, 6)
-        # rot_6d = rotation_matrix[:, :2, :].reshape(-1, 6)
-
-        # Gripper position (usually last dim of qpos)
+        # Gripper
         gripper_position = env.agent.robot.get_qpos()[:, -1:]
 
-        # Return concatenated: [xyz(3), rot6d(6), gripper(1)] -> (Batch, 10)
-        return torch.cat([tcp_pos, tcp_quat, gripper_position], dim=1)
+        # Return [x,y,z, r1..r6, g]
+        return torch.cat([tcp_pos, rot_6d, gripper_position], dim=1)
 
 
 def evaluate_rollout(
@@ -140,7 +145,7 @@ def evaluate_rollout(
 ):
     """
     Perform environment rollout to evaluate success rate.
-    
+
     Args:
         model: The model to evaluate.
         epoch: Current training epoch.
@@ -272,25 +277,25 @@ def evaluate_rollout(
             pred_actions_raw = action_norm.unnormalize(pred_actions_norm)
             horizon = min(EXECUTION_HORIZON, pred_actions_raw.shape[1])
             anchor_state = env.capture_state().to(device)
-            anchor = DecoupledPose.from_env_capture(anchor_state)
+            anchor_pos = anchor_state[:, :3]
 
             # Execution Loop
             for t in range(horizon):
                 step_action = pred_actions_raw[:, t, :]
                 pred_delta_pos = step_action[:, 0:3]
-                pred_delta_aa = step_action[:, 3:6]
-                pred_gripper = step_action[:, 6:7]
+                pred_rot_6d = step_action[:, 3:9]
+                pred_gripper = step_action[:, 9:10]
 
                 curr_state = env.capture_state().to(device)
                 curr = DecoupledPose.from_env_capture(curr_state)
 
                 env_action = compute_step_delta_action(
-                    anchor=anchor,
+                    anchor_pos=anchor_pos,
                     pred_delta_pos=pred_delta_pos,
-                    pred_delta_axis_angle=pred_delta_aa,
+                    pred_rot_6d=pred_rot_6d,  # Passing absolute 6D rotation
                     pred_gripper=pred_gripper,
                     curr=curr,
-                    pos_limit=0.05,
+                    pos_limit=0.1,
                     rot_limit=0.15,
                 )
 
