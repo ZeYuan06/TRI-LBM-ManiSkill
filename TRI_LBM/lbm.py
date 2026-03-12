@@ -226,6 +226,7 @@ class LBM(Module):
                 attn_dim_head=dim_head,
                 cross_attend=False,
                 use_adaptive_layernorm=True,
+                rotary_pos_emb=True,
             ),
         )
 

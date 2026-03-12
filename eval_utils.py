@@ -102,7 +102,6 @@ def compute_step_delta_action(
     if mask.any():
         scale_factor[mask] = rot_limit / (rot_norm[mask] + 1e-8)
     clipped_euler_delta = env_delta_euler * scale_factor
-    # clipped_euler_delta = torch.zeros_like(env_delta_euler)
 
     return torch.cat([clipped_pos_delta, clipped_euler_delta, pred_gripper], dim=1)
 
@@ -179,11 +178,11 @@ def evaluate_rollout(
     else:
         raise FileNotFoundError(f"Assets directory {assets_dir} does not exist.")
 
-    num_envs = 32
+    num_envs = 50
     env = ManiSkillVectorEnv(
         env=PickBoxEnv.uid,
         num_envs=num_envs,
-        auto_reset=True,
+        ignore_terminations=True,
         record_metrics=True,
         obs_mode="rgb",
         control_mode="pd_ee_delta_pose",
@@ -254,7 +253,7 @@ def evaluate_rollout(
         # Reset the environment and initialize history buffers
         obs, _ = env.reset()
         init_base, init_wrist = get_formatted_images(obs)
-        init_pose = env.capture_state().to(device)
+        init_pose = env.get_wrapper_attr("capture_state")().to(device)
         for _ in range(obs_horizon):
             base_rgb_history.append(init_base)
             wrist_rgb_history.append(init_wrist)
@@ -276,7 +275,7 @@ def evaluate_rollout(
 
             pred_actions_raw = action_norm.unnormalize(pred_actions_norm)
             horizon = min(EXECUTION_HORIZON, pred_actions_raw.shape[1])
-            anchor_state = env.capture_state().to(device)
+            anchor_state = env.get_wrapper_attr("capture_state")().to(device)
             anchor_pos = anchor_state[:, :3]
 
             # Execution Loop
@@ -301,7 +300,7 @@ def evaluate_rollout(
 
                 obs, reward, terminated, truncated, info = env.step(env_action)
                 curr_base, curr_wrist = get_formatted_images(obs)
-                curr_pose = env.capture_state().to(device)
+                curr_pose = env.get_wrapper_attr("capture_state")().to(device)
                 base_rgb_history.append(curr_base)
                 wrist_rgb_history.append(curr_wrist)
                 pose_history.append(curr_pose)

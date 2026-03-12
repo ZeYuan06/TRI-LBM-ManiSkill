@@ -31,9 +31,9 @@ class LBMDataModule(pl.LightningDataModule):
     def setup(self, stage=None):
         if self.train_dataset is None or self.val_dataset is None:
             self.full_dataset = MultiViewDataset(
-                data_path=self.data_path, 
+                data_path=self.data_path,
                 num_traj=self.num_traj,
-                stats_path=self.stats_path 
+                stats_path=self.stats_path,
             )
             self.state_norm, self.action_norm = self.full_dataset.get_normalizers()
 
@@ -41,7 +41,9 @@ class LBMDataModule(pl.LightningDataModule):
             train_len = int(0.9 * total_len)
             val_len = total_len - train_len
             self.train_dataset, self.val_dataset = random_split(
-                self.full_dataset, [train_len, val_len], generator=torch.Generator().manual_seed(42)
+                self.full_dataset,
+                [train_len, val_len],
+                generator=torch.Generator().manual_seed(42),
             )
             print(f"[DataModule] Train: {train_len}, Val: {val_len}")
 
