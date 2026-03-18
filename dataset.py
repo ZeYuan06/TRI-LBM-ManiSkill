@@ -1,15 +1,9 @@
-import os
-import glob
 import pickle
 from tqdm import tqdm
 import numpy as np
 import torch
 from torch.utils.data.dataset import Dataset
 from concurrent.futures import ProcessPoolExecutor
-from mani_skill.utils.geometry.rotation_conversions import (
-    quaternion_to_matrix,
-    matrix_to_axis_angle,
-)
 
 
 def debug_visualize_image(img_chw: np.ndarray, save_path: str = "debug_check.png"):
@@ -307,34 +301,29 @@ class StandardNormalizer:
 
 
 class MultiViewDataset(Dataset):
-    def __init__(self, data_path, num_traj, stats_path=None):
+    def __init__(
+        self,
+        file_list: list,
+        state_norm: RamenNormalizer,
+        action_norm: RamenNormalizer,
+        text_cache: dict = None,
+    ):
         """
-        paper config:
-        obs_horizon = 2
-        pred_horizon = 16
+        Multi-View Robotic Manipulation Dataset. Receives precomputed normalizers for states and actions.
         """
         # --- Paper Constraints ---
         self.obs_horizon = 2
         self.pred_horizon = 16
+        self.text_cache = text_cache
 
         self.mean = torch.tensor([0.48145466, 0.4578275, 0.40821073]).view(3, 1, 1)
         self.std = torch.tensor([0.26862954, 0.26130258, 0.27577711]).view(3, 1, 1)
-        print(
-            f"Dataset Params Locked: Obs Horizon={self.obs_horizon}, Pred Horizon={self.pred_horizon}"
-        )
 
         trajectories = {"observations": [], "actions": [], "meta": []}
 
-        print(f"Loading pickle data from {data_path}...")
-        file_pattern = os.path.join(data_path, "**", "trajectory.pkl")
-        files = sorted(glob.glob(file_pattern, recursive=True))
-        if num_traj is not None:
-            files = files[:num_traj]
-
-        print(f"Loading {len(files)} files in parallel...")
         with ProcessPoolExecutor(max_workers=16) as executor:
             results = list(
-                tqdm(executor.map(load_single_episode, files), total=len(files))
+                tqdm(executor.map(load_single_episode, file_list), total=len(file_list))
             )
 
         print("Converting to Tensor (Keeping uint8 for images)...")
@@ -361,56 +350,8 @@ class MultiViewDataset(Dataset):
 
         self.trajectories = trajectories
 
-        if stats_path is not None and os.path.exists(stats_path):
-            print(f"Loading pre-computed normalizer stats from {stats_path}...")
-            state_dict = torch.load(stats_path)
-            self.action_normalizer = RamenNormalizer(state_dict=state_dict["action"])
-            self.state_normalizer = RamenNormalizer(state_dict=state_dict["state"])
-            return
-
-        # Ramen Normalization Preparation (Relativize Data for Stats)
-        print("Calculating Delta Actions for Ramen Normalization...")
-
-        # Sampling strategy to avoid OOM
-        sample_size = min(10000, len(self.slices))
-        sample_indices = np.random.choice(len(self.slices), sample_size, replace=False)
-
-        delta_actions_cache = []
-        states_cache = []
-
-        for idx in tqdm(sample_indices, desc="Computing Norm Stats"):
-            raw_sample = self._get_raw_sample(idx)
-
-            # raw_sample: {'act_seq_delta': ..., 'state_abs': ...}
-            delta_actions_cache.append(raw_sample["act_seq_delta"])
-            states_cache.append(raw_sample["state_seq_abs"])
-
-        all_delta_actions = torch.stack(delta_actions_cache)  # (N, Pred_T, D)
-        all_states = torch.stack(states_cache)  # (N, Obs_T, D)
-
-        # Initialize Normalizers:
-        self.action_normalizer = RamenNormalizer(
-            all_delta_actions,
-            norm_dims=list(range(3)),  # Pos + Rotation
-            gripper_dim=9,  # Gripper uses MinMax
-        )
-
-        # State: Same logic
-        self.state_normalizer = RamenNormalizer(
-            all_states, norm_dims=list(range(3)), gripper_dim=9
-        )
-
-        if stats_path is not None:
-            print(f"Saving normalizer stats to {stats_path}...")
-            torch.save(
-                {
-                    "action": self.action_normalizer.state_dict(),
-                    "state": self.state_normalizer.state_dict(),
-                },
-                stats_path,
-            )
-
-        del delta_actions_cache, all_delta_actions, all_states
+        self.state_normalizer = state_norm
+        self.action_normalizer = action_norm
 
     def get_normalizers(self):
         return self.state_normalizer, self.action_normalizer
@@ -477,11 +418,16 @@ class MultiViewDataset(Dataset):
 
         # Construct Obs Dict
         obs_dict = {"base_rgb": base_rgb, "wrist_rgb": wrist_rgb, "state": norm_state}
+        instruction_str = raw["instruction"]
+        if self.text_cache is not None and instruction_str in self.text_cache:
+            instruction_out = self.text_cache[instruction_str]
+        else:
+            instruction_out = instruction_str
 
         return {
             "observations": obs_dict,
             "actions": norm_action,
-            "instruction": raw["instruction"],
+            "instruction": instruction_out,
         }
 
     def __len__(self):

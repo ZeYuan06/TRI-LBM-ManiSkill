@@ -171,12 +171,15 @@ def evaluate_rollout(
                 obj_file = item / "textured.obj"
                 if obj_file.exists():
                     all_obj_paths.append(str(obj_file))
+        all_obj_paths.sort()  # Ensure consistent order
 
         potential_box = assets_dir / "005_tomato_soup_can" / "textured.obj"
         if potential_box.exists():
             box_obj_path = str(potential_box)
     else:
         raise FileNotFoundError(f"Assets directory {assets_dir} does not exist.")
+
+    all_obj_paths = all_obj_paths[:30]
 
     num_envs = 50
     env = ManiSkillVectorEnv(
@@ -189,7 +192,7 @@ def evaluate_rollout(
         render_mode="rgb_array",
         box_obj_path=box_obj_path,
         distractor_pool_paths=all_obj_paths if all_obj_paths else None,
-        num_distractors=0,
+        num_distractors=2,
         max_episode_steps=max_steps,
     )
     env = StateCaptureWrapper(env)

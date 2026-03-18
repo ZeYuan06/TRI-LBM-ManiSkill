@@ -49,7 +49,7 @@ def main():
     dm.prepare_data()
     dm.setup()
 
-    sample_item = dm.full_dataset[0]
+    sample_item = dm.train_dataset[0]
     action_dim = sample_item["actions"].shape[-1]
     state_dim = sample_item["observations"]["state"].shape[-1]
     obs_horizon = sample_item["observations"]["base_rgb"].shape[0]

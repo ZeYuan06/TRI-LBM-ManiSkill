@@ -304,12 +304,12 @@ class PickBoxEnv(BaseEnv):
             self.box.set_angular_velocity(torch.zeros((b, 3), device=self.device))
 
             # Place Distractors
-            # far_away_pos = torch.zeros((b, 3), device=self.device)
-            # for i, obj in enumerate(self.no_grasp_objs):
-            #     far_away_pos[:, 2] = -11.0 - i
-            #     obj.set_pose(Pose.create_from_pq(far_away_pos, qs))
-            #     obj.set_linear_velocity(torch.zeros((b, 3), device=self.device))
-            #     obj.set_angular_velocity(torch.zeros((b, 3), device=self.device))
+            far_away_pos = torch.zeros((b, 3), device=self.device)
+            for i, obj in enumerate(self.no_grasp_objs):
+                far_away_pos[:, 2] = -11.0 - i
+                obj.set_pose(Pose.create_from_pq(far_away_pos, qs))
+                obj.set_linear_velocity(torch.zeros((b, 3), device=self.device))
+                obj.set_angular_velocity(torch.zeros((b, 3), device=self.device))
 
             new_bounds = torch.tensor(distractor_region, device=self.device)
             sampler._bounds = new_bounds

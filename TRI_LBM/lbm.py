@@ -173,18 +173,17 @@ class LBM(Module):
     ):
         super().__init__()
         # Clip, they use
-
         # ViT-B-16 for images
         # ViT-B-32 for language
         language_model, _, _ = open_clip.create_model_and_transforms(
             clip_language_model, pretrained=language_pretrained_name
         )
         language_model.eval()
-
         for param in language_model.parameters():
             param.requires_grad = False  # Paper: Keep frozen
-
         tokenizer = open_clip.get_tokenizer(clip_language_model)
+        self.language_model = language_model
+        self.language_tokenizer = tokenizer
 
         image_model, _, _ = open_clip.create_model_and_transforms(
             clip_image_model, pretrained=image_pretrained_name
@@ -192,17 +191,11 @@ class LBM(Module):
 
         # cheap way to get feat dimensions
         # assume one image for starters
-
         dim_text_feats = language_model.encode_text(tokenizer(["test"])).shape[-1]
         dim_image_feats = image_model.encode_image(torch.randn(1, 3, 224, 224)).shape[
             -1
         ]
-
-        # store language and image model as video frame processor
-        self.language_model = language_model
-        self.language_tokenizer = tokenizer
         self.image_model = image_model
-
         self.text_proj = nn.Linear(dim_text_feats, dim)
 
         dim_per_step = dim + (num_cameras * dim_image_feats) + dim_pose
@@ -260,11 +253,12 @@ class LBM(Module):
         Structure: [B, T * (Text + Images + Pose)]
         """
         # Text Features
-        if not is_tensor(text):
-            text = self.language_tokenizer(text).to(self.device)
-
-        with torch.no_grad():
-            text_embeds = self.language_model.encode_text(text)  # [B, 512]
+        if is_tensor(text):
+            text_embeds = text.to(self.device).float()
+        else:
+            text_tokens = self.language_tokenizer(text).to(self.device)
+            with torch.no_grad():
+                text_embeds = self.language_model.encode_text(text_tokens)
 
         # Trainable Projection (Paper requirement)
         text_embeds = self.text_proj(text_embeds)  # [B, Dim]
